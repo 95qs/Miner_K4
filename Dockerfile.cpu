@@ -14,7 +14,9 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 RUN pip install --upgrade pip \
- && pip install -r /app/requirements.txt
+ && pip install -r /app/requirements.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    --trusted-host pypi.tuna.tsinghua.edu.cn
 
 COPY service/ /app/service/
 
