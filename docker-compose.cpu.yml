@@ -1,0 +1,40 @@
+# ── CPU docker-compose ─────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  k4-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: k4-service:cpu
+    container_name: k4-service-cpu
+    restart: unless-stopped
+
+    ports:
+      - "8001:8000"
+
+    volumes:
+      - ./models:/app/models
+      - ./service:/app/service
+
+    environment:
+      - DEVICE=cpu
+      - HF_ENDPOINT=https://hf-mirror.com
+      - DEFAULT_MODEL_VERSION=${DEFAULT_MODEL_VERSION:-default}
+      - WARM_UP=true
+      - LOG_LEVEL=info
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - k4-net
+
+networks:
+  k4-net:
+    driver: bridge

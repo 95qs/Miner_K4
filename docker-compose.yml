@@ -1,0 +1,50 @@
+# ── GPU docker-compose ─────────────────────────────────────────────────────────
+# Requires NVIDIA Container Toolkit on the host:
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+version: "3.9"
+
+services:
+  k4-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: k4-service:latest
+    container_name: k4-service
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    # Mount the host models/ directory so trained models survive container rebuilds
+    volumes:
+      - ./models:/app/models
+      - ./service:/app/service
+
+    environment:
+      - DEVICE=cuda
+      - DEFAULT_MODEL_VERSION=${DEFAULT_MODEL_VERSION:-default}
+      - WARM_UP=true
+      - LOG_LEVEL=info
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - k4-net
+
+networks:
+  k4-net:
+    driver: bridge

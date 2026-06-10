@@ -1,0 +1,26 @@
+# ── CPU Dockerfile ──────────────────────────────────────────────────────────────
+# Build:  docker build -f Dockerfile.cpu -t k4-service:cpu .
+# Run:    docker compose -f docker-compose.cpu.yml up
+
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEVICE=cpu
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install --upgrade pip \
+ && pip install -r /app/requirements.txt
+
+COPY service/ /app/service/
+
+ENV PYTHONPATH="/app:${PYTHONPATH}" \
+    HF_ENDPOINT=https://hf-mirror.com
+
+EXPOSE 8000
+
+CMD ["uvicorn", "service.api:app", "--host", "0.0.0.0", "--port", "8000"]

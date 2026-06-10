@@ -1,0 +1,52 @@
+# ── GPU Dockerfile ──────────────────────────────────────────────────────────────
+# Build:  docker build -f Dockerfile.gpu -t k4-service:latest .
+# Run:    docker compose -f docker-compose.yml up
+#
+# Notes:
+#   - CUDA base image includes Python 3.10; no conda needed.
+#   - All model files are mounted as a volume so the image is reusable
+#     across model versions without rebuilding.
+#   - The entrypoint script checks CUDA availability and sets DEVICE=cuda
+#     automatically; falling back to CPU if no GPU is detected.
+
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEVICE=cuda
+
+WORKDIR /app
+
+# Install Python and core system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-venv python3-pip \
+        git curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python
+
+# Copy requirements first (layer cache)
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install --upgrade pip \
+ && pip install -r /app/requirements.txt
+
+# Copy application code (exclude models/ at build time – bind-mounted at runtime)
+COPY service/ /app/service/
+
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
+# Pre-download the sentence-transformer model so the first request is fast.
+# We pick a fixed tag so the image is deterministic.
+# Models are placed directly under /app/models so docker-compose can bind-mount them.
+RUN SENTENCE_TRANSFORMERS_HOME=/app/models \
+    HF_HOME=/app/models \
+    python -c " \
+    from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('all-MiniLM-L6-v2', cache_folder='/app/models', device='cpu'); \
+    print('Embedder cached at /app/models')"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "service.api:app", "--host", "0.0.0.0", "--port", "8000"]
