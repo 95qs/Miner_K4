@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "info"
 
     # ── CORS ───────────────────────────────────────────────
-    CORS_ORIGINS: list[str] = ["*"]
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:8000"]
 
     class Config:
         env_file = ".env"

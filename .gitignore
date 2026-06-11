@@ -1,10 +1,12 @@
+# Environment variables (MUST be first – contains secrets)
+.env
+
 # Environments
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
-.env
 
 # IDE
 .idea/

@@ -127,7 +127,8 @@ def run_training(
     print(f"  Train: {len(train_logs):,} logs")
 
     val_logs = []
-    if val_file and (data_dir / val_file).exists() or Path(val_file).exists():
+    val_path = (data_dir / val_file) if data_dir else Path(val_file)
+    if val_file and val_path.exists():
         try:
             val_logs = load(val_file)
             print(f"  Val:   {len(val_logs):,} logs")

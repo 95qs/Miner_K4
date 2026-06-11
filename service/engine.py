@@ -235,7 +235,7 @@ class K4Engine:
         if self._embedder is None:
             raise RuntimeError("K4Engine is not loaded. Call .load() first.")
 
-        # 1. Normalize
+        # 1. Normalize (list comprehension – regex ops are cheap; no need for threading)
         norm_logs = [normalize_log(log) for log in logs]
 
         # 2. Embed (single batch)
