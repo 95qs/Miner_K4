@@ -66,6 +66,40 @@ def load_csv_logs(file_path: str) -> list[str]:
     return df["content"].tolist()
 
 
+def _knn_scores(
+    query_embeddings: np.ndarray,
+    normal_embeddings: np.ndarray,
+    k: int,
+    device: str,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """
+    Compute mean KNN distance for each query embedding against a normal manifold.
+
+    Args:
+        query_embeddings: (n_query, d) numpy array
+        normal_embeddings: (n_ref, d) numpy array
+        k: number of nearest neighbors
+        device: 'cuda' or 'cpu'
+        batch_size: batch size for processing
+
+    Returns:
+        (n_query,) array of mean k-NN distances (higher = more anomalous)
+    """
+    ref_tensor = torch.from_numpy(normal_embeddings).float().to(device)
+    all_scores = []
+
+    for i in range(0, len(query_embeddings), batch_size):
+        batch = query_embeddings[i : i + batch_size]
+        query_tensor = torch.from_numpy(batch).float().to(device)
+        d = torch.cdist(query_tensor, ref_tensor)
+        topk_dists, _ = torch.topk(d, min(k, ref_tensor.shape[0]), largest=False)
+        knn_mean = topk_dists.mean(dim=1)
+        all_scores.append(knn_mean.cpu().numpy())
+
+    return np.concatenate(all_scores)
+
+
 def run_training(
     data_dir: str | Path | None,
     model_version: str,
@@ -83,10 +117,10 @@ def run_training(
     Train a K4 model from normal log files.
 
     Expected layout under data_dir (or files given as absolute paths):
-        train_normal.jsonl   – normal logs for training
-        val_normal.jsonl     – normal logs for threshold calibration (optional)
-        test_normal.jsonl    – held-out normal logs (optional)
-        test_anomaly.csv     – labelled fault logs (optional)
+        train_normal.jsonl   - normal logs for training
+        val_normal.jsonl     - normal logs for threshold calibration (optional)
+        test_normal.jsonl    - held-out normal logs (optional)
+        test_anomaly.csv     - labelled fault logs (optional)
 
     If val_file / test files are missing the script will skip those steps.
     """
@@ -108,7 +142,7 @@ def run_training(
     print(f"  Normalize:       {normalize}")
     print("=" * 70)
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
+    # --- 1. Load data --------------------------------------------------------
     def load(path: str) -> list[str]:
         p = Path(path)
         if not p.is_absolute():
@@ -122,7 +156,7 @@ def run_training(
         else:
             raise ValueError(f"Unsupported file type: {p}")
 
-    print("\n[Data] Loading logs …")
+    print("\n[Data] Loading logs ...")
     train_logs = load(train_file)
     print(f"  Train: {len(train_logs):,} logs")
 
@@ -136,19 +170,19 @@ def run_training(
             pass
 
     if normalize:
-        print("\n[Normalize] Applying variable substitution …")
+        print("\n[Normalize] Applying variable substitution ...")
         train_logs = [normalize_log(l) for l in train_logs]
         if val_logs:
             val_logs = [normalize_log(l) for l in val_logs]
 
-    # ── 2. Embedding ───────────────────────────────────────────────────────────
-    print(f"\n[Embedding] Loading {embedder_name} on {device} …")
+    # --- 2. Embedding --------------------------------------------------------
+    print(f"\n[Embedding] Loading {embedder_name} on {device} ...")
     embedder = SentenceTransformer(
         resolve_embedder_path(embedder_name), device=device
     )
 
     t0 = time.time()
-    print("  Encoding train logs …")
+    print("  Encoding train logs ...")
     train_embeddings = embedder.encode(
         train_logs,
         batch_size=settings.DEFAULT_EMBEDDING_BATCH_SIZE,
@@ -162,7 +196,7 @@ def run_training(
     val_embeddings = None
     if val_logs:
         t0 = time.time()
-        print("  Encoding val logs …")
+        print("  Encoding val logs ...")
         val_embeddings = embedder.encode(
             val_logs,
             batch_size=settings.DEFAULT_EMBEDDING_BATCH_SIZE,
@@ -171,28 +205,27 @@ def run_training(
         )
         print(f"  Val embedding time: {time.time() - t0:.2f}s")
 
-    # ── 3. PRDC ────────────────────────────────────────────────────────────────
-    print(f"\n[PRDC] Computing descriptors (k={k}) …")
+    # --- 3. Detector (optional, for backward compatibility) --------------------
+    # PRDC + ML detector training is kept for reference but the inference engine
+    # now uses KNN distance scoring instead (see engine._knn_score).
+    # We still train the detector so saved models remain compatible.
+    print(f"\n[Detector] Training {detector_type} ...")
     t0 = time.time()
+
+    prdc_time = 0.0
+    prdc_val = None
+
+    # Compute PRDC for detector training (cross between two halves of training set)
+    half = len(train_embeddings) // 2
+    prdc_t0 = time.time()
     prdc_train = compute_prdc_batch(
-        train_embeddings, train_embeddings,
+        train_embeddings[:half],
+        train_embeddings[:half],
         k=k, batch_size=settings.DEFAULT_BATCH_SIZE, device=device,
     )
-    prdc_time = time.time() - t0
-    print(f"  PRDC train time: {prdc_time:.2f}s")
-
-    prdc_val = None
-    if val_embeddings is not None:
-        t0 = time.time()
-        prdc_val = compute_prdc_batch(
-            train_embeddings, val_embeddings,
-            k=k, batch_size=settings.DEFAULT_BATCH_SIZE, device=device,
-        )
-        print(f"  PRDC val time: {time.time() - t0:.2f}s")
-
-    # ── 4. Detector ────────────────────────────────────────────────────────────
-    print(f"\n[Detector] Training {detector_type} …")
-    t0 = time.time()
+    prdc_time += time.time() - prdc_t0
+    n_unique = len(set(map(tuple, prdc_train.round(6))))
+    print(f"  PRDC train time: {prdc_time:.2f}s  ({n_unique}/{len(prdc_train)} unique vectors)")
 
     detector_params = {}
     if detector_type == "gmm":
@@ -202,28 +235,46 @@ def run_training(
     detector.fit(prdc_train)
     print(f"  Detector training time: {time.time() - t0:.4f}s")
 
-    # ── 5. Threshold calibration ──────────────────────────────────────────────
-    # If we have labelled anomaly data we can calibrate a real threshold;
-    # otherwise fall back to the detector's own internal threshold.
-    if prdc_val is not None:
-        # Self-evaluation on val set (val is also "normal")
-        val_scores = detector.score(prdc_val)
-        # Use 95th percentile of normal scores as threshold
-        threshold = float(np.percentile(val_scores, 95))
-        normal_mean = float(val_scores.mean())
-        normal_std = float(val_scores.std())
-        print(f"\n[Threshold] {threshold:.6f}  (95th percentile of val scores)")
-        print(f"  Val score mean={normal_mean:.4f} std={normal_std:.4f}")
-    else:
-        # Conservative default: use a small fraction above detector's mean
-        train_scores = detector.score(prdc_train)
-        normal_mean = float(train_scores.mean())
-        normal_std = float(train_scores.std())
-        threshold = float(np.percentile(train_scores, 95))
-        print(f"\n[Threshold] {threshold:.6f}  (95th percentile of train scores, fallback)")
+    # --- 4. KNN threshold calibration ----------------------------------------
+    # The inference engine uses KNN distance scoring.  We calibrate the threshold
+    # here so that future training produces consistent threshold values.
+    # The threshold is the 99th percentile of normal KNN distances on the val set.
+    print(f"\n[KNN] Computing threshold (k={k}) ...")
 
-    # ── 6. Save ────────────────────────────────────────────────────────────────
-    print(f"\n[Save] Persisting model to {models_dir}/{model_version} …")
+    if val_embeddings is not None:
+        t0 = time.time()
+        # KNN scores on val set: each val embedding vs ALL train embeddings
+        val_knn_scores = _knn_scores(
+            val_embeddings, train_embeddings, k=k, device=device,
+            batch_size=settings.DEFAULT_BATCH_SIZE,
+        )
+        knn_time = time.time() - t0
+        print(f"  KNN val time: {knn_time:.2f}s")
+        print(f"  Val KNN scores: mean={val_knn_scores.mean():.6f}, "
+              f"std={val_knn_scores.std():.6f}, "
+              f"max={val_knn_scores.max():.6f}")
+
+        # Use 99th percentile as threshold (1% false positive rate on normal logs)
+        threshold = float(np.percentile(val_knn_scores, 99))
+        normal_mean = float(val_knn_scores.mean())
+        normal_std = float(val_knn_scores.std())
+        print(f"\n[Threshold] {threshold:.6f}  (99th percentile of val KNN scores)")
+        print(f"  Normal mean={normal_mean:.6f}, std={normal_std:.6f}")
+    else:
+        # Fallback: use 99th percentile of KNN scores on training set (cross)
+        train_knn_scores = _knn_scores(
+            train_embeddings[half:],
+            train_embeddings[:half],
+            k=k, device=device,
+            batch_size=settings.DEFAULT_BATCH_SIZE,
+        )
+        threshold = float(np.percentile(train_knn_scores, 99))
+        normal_mean = float(train_knn_scores.mean())
+        normal_std = float(train_knn_scores.std())
+        print(f"\n[Threshold] {threshold:.6f}  (99th percentile of train KNN scores, fallback)")
+
+    # --- 5. Save ------------------------------------------------------------
+    print(f"\n[Save] Persisting model to {models_dir}/{model_version} ...")
     model_path = save_model(
         model_version=model_version,
         config={
@@ -274,7 +325,7 @@ def main() -> None:
                         help="Directory name for the saved model, e.g. 'syslog_gmm_k5_v1'")
     parser.add_argument("--embedder", type=str, default="all-MiniLM-L6-v2")
     parser.add_argument("--detector", type=str, default="gmm",
-                        choices=["gmm", "kde", "ocsvm", "deepsvd"])
+                        choices=["gmm", "kde", "ocsvm", "deepsvd", "iforest"])
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--n-components", type=int, default=3)
     parser.add_argument("--device", type=str, default=None)

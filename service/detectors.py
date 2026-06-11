@@ -167,6 +167,42 @@ class DeepSVDDDetector(BaseDetector):
         return dists.cpu().numpy()
 
 
+class IsolationForestDetector(BaseDetector):
+    """
+    Isolation Forest 检测器。
+
+    不依赖数据的概率分布假设，通过随机切分来隔离异常点。
+    异常点路径短（fewer splits needed to isolate），因此 anomaly score 高。
+
+    分数含义：值越高越异常（与 GMM 的 -log-likelihood 方向一致）。
+    """
+
+    def __init__(self, n_estimators: int = 100, contamination: float = 0.1, random_state: int = 42):
+        super().__init__()
+        self.n_estimators = n_estimators
+        self.contamination = contamination
+        self.random_state = random_state
+        self.model = None
+
+    def fit(self, prdc_features: np.ndarray):
+        from sklearn.ensemble import IsolationForest
+        X_scaled = self.scaler.fit_transform(prdc_features)
+        self.model = IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        self.model.fit(X_scaled)
+        self.fitted = True
+
+    def score(self, prdc_features: np.ndarray) -> np.ndarray:
+        X_scaled = self._scale(prdc_features)
+        # decision_function: 值越高越正常 → 取负使其越高越异常
+        raw = self.model.decision_function(X_scaled)
+        return -raw
+
+
 class DetectorFactory:
     """检测器工厂"""
 
@@ -175,6 +211,7 @@ class DetectorFactory:
         "kde": KDETector,
         "ocsvm": OCSVMDetector,
         "deepsvd": DeepSVDDDetector,
+        "iforest": IsolationForestDetector,
     }
 
     @classmethod

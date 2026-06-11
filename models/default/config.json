@@ -1,0 +1,11 @@
+{
+  "embedder_name": "all-MiniLM-L6-v2",
+  "detector_type": "iforest",
+  "k": 5,
+  "n_training_samples": 30000,
+  "embedding_dim": 384,
+  "n_components": 3,
+  "detector_params": {},
+  "model_version": "default",
+  "device": "cpu"
+}

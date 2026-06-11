@@ -17,8 +17,11 @@ venv/
 # Docker
 .docker/
 
-# Models (trained artifacts)
-models/
+# Models: only store trained detector artifacts
+# The embedder model (all-MiniLM-L6-v2, ~976MB) is downloaded automatically
+# from HuggingFace Hub and should NOT be committed.
+models/all-MiniLM-L6-v2/
+models/models--sentence-transformers--*/
 
 # Logs
 *.log

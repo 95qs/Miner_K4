@@ -1,0 +1,5 @@
+{
+  "threshold": 0.521,
+  "normal_scores_mean": 0.01,
+  "normal_scores_std": 0.088
+}

@@ -13,7 +13,10 @@ def any_model_available():
     """Skip if no model has been trained yet."""
     from pathlib import Path
     models_dir = Path(__file__).parent.parent / "models"
-    available = [d.name for d in models_dir.iterdir() if d.is_dir()]
+    available = [
+        d.name for d in models_dir.iterdir()
+        if d.is_dir() and (d / "normal_embeddings.npy").exists()
+    ]
     if not available:
         pytest.skip("No trained model found in models/. Run train_service first.")
     return available[0]

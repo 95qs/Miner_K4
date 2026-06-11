@@ -8,6 +8,8 @@ Design goals:
     concurrent requests serialise embedding calls (important on single GPU).
   - Confidence: raw anomaly scores are mapped to [0, 1] via a smoothed
     sigmoid based on the known normal-score distribution.
+  - Scoring: uses KNN mean distance as the primary anomaly score (much more
+    robust than PRDC + ML detector for dense embeddings).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import math
 from typing import Any, Optional
 
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 
 from .config import Settings, resolve_device, resolve_embedder_path
@@ -29,9 +32,9 @@ class K4Engine:
     Inference engine backed by a saved K4 model.
 
     Lifecycle:
-      K4Engine.load(model_version)  → load all artifacts into memory
-      K4Engine.detect_one(log)      → dict with is_fault / confidence / ...
-      K4Engine.detect_batch(logs)    → list[dict]
+      K4Engine.load(model_version)  -> load all artifacts into memory
+      K4Engine.detect_one(log)      -> dict with is_fault / confidence / ...
+      K4Engine.detect_batch(logs)  -> list[dict]
     """
 
     def __init__(self) -> None:
@@ -48,6 +51,9 @@ class K4Engine:
 
         # Protects embedder calls on a shared GPU
         self._embed_lock: asyncio.Lock = asyncio.Lock()
+
+        # Torch tensors for KNN scoring (avoid re-creating each request)
+        self._normal_emb_tensor: Optional[torch.Tensor] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -68,7 +74,12 @@ class K4Engine:
         # Normal embeddings (kept in CPU RAM)
         self._normal_embeddings = artifacts["normal_embeddings"]
 
-        # Detector + scaler
+        # Pre-convert to torch tensor for fast KNN scoring
+        self._normal_emb_tensor = torch.from_numpy(
+            self._normal_embeddings
+        ).float().to(self._device)
+
+        # Detector + scaler (for backward compatibility / PRDC mode)
         self._scaler = artifacts["scaler"]
         self._detector = artifacts["detector"]
 
@@ -94,8 +105,6 @@ class K4Engine:
         device = self._device
         n = min(n_samples, len(self._normal_embeddings))
         dummy = ["warm up log entry"] * n
-        # We only need to run through the embedder; the detector part
-        # is negligible, so we skip the full pipeline.
         self._embedder.encode(dummy, batch_size=n, show_progress_bar=False)
         print("[K4Engine] Warm-up complete.")
 
@@ -116,7 +125,6 @@ class K4Engine:
     async def _embed(self, texts: list[str]) -> np.ndarray:
         """Async wrapper around SentenceTransformer.encode."""
         async with self._embed_lock:
-            # Run in a thread pool so FastAPI's async event loop is not blocked
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
@@ -128,6 +136,37 @@ class K4Engine:
                 ),
             )
             return result
+
+    def _knn_score(self, query_emb: np.ndarray, k: int | None = None) -> np.ndarray:
+        """
+        Compute KNN mean distance anomaly score.
+
+        For each query embedding, find the k nearest normal embeddings
+        and return the mean distance.  Higher = more anomalous (far from
+        the normal manifold).
+
+        Args:
+            query_emb: (n_query, d) numpy array
+            k: number of nearest neighbors (default from config)
+
+        Returns:
+            (n_query,) array of mean k-NN distances (higher = more anomalous)
+        """
+        if len(query_emb) == 0:
+            return np.array([], dtype=np.float32)
+
+        k = k or self._config.get("k", 5)
+
+        query_tensor = torch.from_numpy(query_emb).float().to(self._device)
+
+        # Compute distances: (n_query, n_ref)
+        d = torch.cdist(query_tensor, self._normal_emb_tensor)
+
+        # Top-k SMALLEST distances -> k nearest neighbors
+        topk_dists, _ = torch.topk(d, k, largest=False)
+        knn_mean = topk_dists.mean(dim=1)
+
+        return knn_mean.cpu().numpy()
 
     def _compute_prdc(self, query_emb: np.ndarray) -> np.ndarray:
         """Compute PRDC features for a batch of query embeddings."""
@@ -142,24 +181,35 @@ class K4Engine:
         )
 
     def _score(self, prdc: np.ndarray) -> np.ndarray:
-        """Return anomaly scores for PRDC features."""
+        """Return anomaly scores for PRDC features (legacy path)."""
         prdc_scaled = self._scaler.transform(prdc)
-        return self._detector.score(prdc_scaled)
+        name = type(self._detector).__name__
+
+        if name == "GaussianMixture":
+            raw = self._detector.score_samples(prdc_scaled)
+            return -raw
+        elif name == "IsolationForest":
+            raw = self._detector.decision_function(prdc_scaled)
+            return -raw
+        elif name == "OneClassSVM":
+            raw = self._detector.decision_function(prdc_scaled)
+            return -raw
+        else:
+            return self._detector.score(prdc_scaled)
 
     def _to_confidence(self, raw_score: float) -> float:
         """
-        Map raw anomaly score → [0, 1] confidence that the log is FAULTY.
+        Map raw anomaly score -> [0, 1] confidence that the log is FAULTY.
 
         We use a smoothed sigmoid centred on the threshold:
             z = (raw - threshold) / std
             confidence = sigmoid(z)
         This gives:
-            score << threshold  → confidence ≈ 0  (confident normal)
-            score ≈ threshold  → confidence ≈ 0.5 (uncertain)
-            score >> threshold → confidence ≈ 1  (confident fault)
+            score << threshold  -> confidence ~ 0  (confident normal)
+            score ~= threshold  -> confidence ~= 0.5  (uncertain)
+            score >> threshold  -> confidence ~= 1  (confident fault)
         """
         z = (raw_score - self._threshold) / self._normal_std
-        # Clamp to avoid math overflow in exp
         z = max(-500.0, min(500.0, z))
         conf = 1.0 / (1.0 + math.exp(-z))
         return round(float(conf), 3)
@@ -189,13 +239,10 @@ class K4Engine:
         # 2. Embed
         emb = await self._embed([norm_log])
 
-        # 3. PRDC
-        prdc = self._compute_prdc(emb)
+        # 3. Score: KNN distance (primary, robust for dense embeddings)
+        raw_score = float(self._knn_score(emb)[0])
 
-        # 4. Score
-        raw_score = float(np.atleast_1d(self._score(prdc))[0])
-
-        # 5. Decision
+        # 4. Decision
         is_fault = raw_score >= self._threshold
         confidence = self._to_confidence(raw_score)
 
@@ -208,6 +255,7 @@ class K4Engine:
         }
 
         if return_prdc:
+            prdc = self._compute_prdc(emb)
             result["prdc"] = {
                 "precision": round(float(prdc[0, 0]), 4),
                 "recall": round(float(prdc[0, 1]), 4),
@@ -235,17 +283,17 @@ class K4Engine:
         if self._embedder is None:
             raise RuntimeError("K4Engine is not loaded. Call .load() first.")
 
-        # 1. Normalize (list comprehension – regex ops are cheap; no need for threading)
+        if not logs:
+            return []
+
+        # 1. Normalize
         norm_logs = [normalize_log(log) for log in logs]
 
         # 2. Embed (single batch)
         embeddings = await self._embed(norm_logs)
 
-        # 3. PRDC
-        prdc = self._compute_prdc(embeddings)
-
-        # 4. Score
-        raw_scores = self._score(prdc)
+        # 3. Score: KNN distance
+        raw_scores = self._knn_score(embeddings)
 
         results = []
         for i, score in enumerate(raw_scores):
@@ -260,11 +308,12 @@ class K4Engine:
             }
 
             if return_prdc:
+                prdc_batch = self._compute_prdc(embeddings[i : i + 1])
                 item["prdc"] = {
-                    "precision": round(float(prdc[i, 0]), 4),
-                    "recall": round(float(prdc[i, 1]), 4),
-                    "density": round(float(prdc[i, 2]), 4),
-                    "coverage": round(float(prdc[i, 3]), 4),
+                    "precision": round(float(prdc_batch[0, 0]), 4),
+                    "recall": round(float(prdc_batch[0, 1]), 4),
+                    "density": round(float(prdc_batch[0, 2]), 4),
+                    "coverage": round(float(prdc_batch[0, 3]), 4),
                 }
 
             results.append(item)
